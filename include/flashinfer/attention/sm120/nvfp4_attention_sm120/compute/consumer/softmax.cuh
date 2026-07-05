@@ -283,6 +283,15 @@ struct SoftmaxFused {
 
 #if !defined(DIRECT_P_QUANT_SOFTMAX)
 
+    // Round each chunk scale to its ue4m3-representable value before taking
+    // the reciprocal, so the payload divides by exactly what the PV mma will
+    // multiply back; otherwise the scale-factor rounding error is left
+    // uncompensated in P (the Q/K/V quantize kernels do the same round-trip).
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < size(AbsMaxP); ++i) {
+      AbsMaxP(i) = float(cutlass::float_ue4m3_t(AbsMaxP(i)));
+    }
+
 #if defined(SCALAR_INV_ABSMAXP)
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size(AbsMaxP); ++i) {
