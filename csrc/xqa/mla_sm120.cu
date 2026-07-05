@@ -69,10 +69,13 @@ inline constexpr mmaShape kernelQmmaShape = is_fp8 ? mmaShape{16, 8, 32} : mmaSh
 inline constexpr float xScale = 1.f / kE4M3_MAX;
 __constant__ constexpr float rcpXScale = kE4M3_MAX;
 
+inline constexpr bool computeRowSumFromF8 = true;
+// rowSum carries the rcpXScale factor when it is accumulated from the fp8-quantized X
+// tile (computeRowSumFromF8); fold the compensation into the LSE computation.
+inline constexpr float lseRowSumScale = (is_fp8 && computeRowSumFromF8) ? xScale : 1.f;
+
 inline constexpr uint32_t nbRegsForIOWarps = 32;
 inline constexpr uint32_t nbRegsForMathWarps = 232;
-
-inline constexpr bool computeRowSumFromF8 = true;
 
 struct KVTilePartLoader {
   static_assert(tokensPerPage % tokensPerTile == 0 || tokensPerTile % tokensPerPage == 0);
@@ -396,9 +399,9 @@ struct SharedMemB {
 
 __device__ void mergePartialOutputs(uint32_t& semaphore,
                                     Vec<OutputHead, PartialResult::nbRowsPerChunk>& dst,
-                                    PartialResult const* reqPartialResults, uint32_t nbSubSeq,
-                                    uint32_t ctaRank, uint32_t warpRank, uint2 warpIdx,
-                                    void* sharedMem);
+                                    float* dstLse, PartialResult const* reqPartialResults,
+                                    uint32_t nbSubSeq, uint32_t ctaRank, uint32_t warpRank,
+                                    uint2 warpIdx, void* sharedMem);
 
 struct KernelArgs {
   CUtensorMap const& tensorMapQ;  // MhaIOHead[nbQHeads * totalNbInputTokens]
@@ -413,6 +416,8 @@ struct KernelArgs {
       cgaXBuf;                                        // [totalNbInputTokens][maxNbSubSeq]
   uint32_t* __restrict__ const& semaphores;           // [totalNbInputTokens]
   PartialResult* __restrict__ const& partialResults;  // [totalNbInputTokens][maxNbSubSeq]
+  // Optional base-2 log-sum-exp output: [totalNbInputTokens][nbQHeads]. nullptr to skip.
+  float* __restrict__ const& lse;
 };
 
 struct Producer {
@@ -531,6 +536,10 @@ struct Producer {
                           reinterpret_cast<Vec<OutputHead, PartialResult::nbRowsPerChunk>&>(
                               args.output[headGrpSize * idxInputTokenGlobal +
                                           PartialResult::nbRowsPerChunk * ctaRank]),
+                          args.lse == nullptr
+                              ? nullptr
+                              : args.lse + headGrpSize * idxInputTokenGlobal +
+                                    PartialResult::nbRowsPerChunk * ctaRank,
                           args.partialResults + maxNbSubSeq * idxInputTokenGlobal, nbSubSeq,
                           ctaRank, warpRank, warpIdx, &smem);
     }
@@ -1138,6 +1147,10 @@ struct Consumer {
                           reinterpret_cast<Vec<OutputHead, PartialResult::nbRowsPerChunk>&>(
                               args.output[headGrpSize * idxInputTokenGlobal +
                                           PartialResult::nbRowsPerChunk * ctaRank]),
+                          args.lse == nullptr
+                              ? nullptr
+                              : args.lse + headGrpSize * idxInputTokenGlobal +
+                                    PartialResult::nbRowsPerChunk * ctaRank,
                           args.partialResults + maxNbSubSeq * idxInputTokenGlobal, nbSubSeq,
                           ctaRank, warpRank, warpIdx, &smem);
     }
@@ -1334,15 +1347,27 @@ __device__ inline void Consumer::compute() {
   smem.mathWarpsBar.wait_parity(false);
 
   storeOutput(dst, gemm1V * idxConsumer() + tileBase.x, output, swizzleBuf, lane);
-  if (isMultiBlockMode && tileIdx.x == 0) {
+  if (tileIdx.x == 0 && (isMultiBlockMode || args.lse != nullptr)) {
     ThrdRegRowMax const accRowMaxLog2e =
         loadShmRowMax<warpTile.y>(smem.accRowMaxLog2e[tileIdx.x], tileBase.y, lane);
-    auto& chunk =
-        args.partialResults[maxNbSubSeq * idxInputTokenGlobal + idxSubSeq].chunks[tileIdx.y];
+    if (isMultiBlockMode) {
+      auto& chunk =
+          args.partialResults[maxNbSubSeq * idxInputTokenGlobal + idxSubSeq].chunks[tileIdx.y];
 #pragma unroll
-    for (uint32_t i = 0; i < ThrdRegRowMax::size; i++) {
-      chunk.rowMaxLog2e[warp_size * i + lane] = accRowMaxLog2e[i];
-      chunk.rowSum[warp_size * i + lane] = accRowSum[i];
+      for (uint32_t i = 0; i < ThrdRegRowMax::size; i++) {
+        chunk.rowMaxLog2e[warp_size * i + lane] = accRowMaxLog2e[i];
+        chunk.rowSum[warp_size * i + lane] = accRowSum[i];
+      }
+    } else {
+      // Single-block mode: this CTA holds the final softmax state, so write the base-2
+      // log-sum-exp directly (multi-block LSE is written by mergePartialOutputs). Both
+      // consumer CTAs hold identical row stats; the duplicate store is benign, matching
+      // the partial-result stats store above.
+#pragma unroll
+      for (uint32_t i = 0; i < ThrdRegRowMax::size; i++) {
+        args.lse[headGrpSize * idxInputTokenGlobal + tileBase.y + warp_size * i + lane] =
+            accRowMaxLog2e[i] + log2f(accRowSum[i] * lseRowSumScale);
+      }
     }
   }
   smem.xBars[idxXVBufLast].consumed.arrive();
@@ -1483,7 +1508,7 @@ __device__ inline void Consumer::storeOutput(Vec<OutputHead, warpTile.y>& dst, u
 
 __device__ inline void mergePartialOutputs(uint32_t& semaphore,
                                            Vec<OutputHead, PartialResult::nbRowsPerChunk>& dst,
-                                           PartialResult const* reqPartialResults,
+                                           float* dstLse, PartialResult const* reqPartialResults,
                                            uint32_t nbSubSeq, uint32_t ctaRank, uint32_t warpRank,
                                            uint2 warpIdx, void* sharedMem) {
   assert(nbSubSeq > 1);
@@ -1627,6 +1652,11 @@ __device__ inline void mergePartialOutputs(uint32_t& semaphore,
       for (uint32_t j = 0; j < regGrainsPerRow; j++) {
         dstHead[warp_size * j + lane] = convert<OutputElem>(acc(i, j) * scale);
       }
+      // The merged (max, sum) pair is the global softmax state; every subseq's rowSum
+      // carries the same lseRowSumScale factor, so one compensation is exact.
+      if (dstLse != nullptr && lane == 0) {
+        dstLse[tileRowBase + i] = accRowMaxLog2e[i] + log2f(accRowSum[i] * lseRowSumScale);
+      }
     }
   }
 }
@@ -1644,9 +1674,11 @@ __launch_bounds__(32 * 4 * 3, 1) __cluster_dims__(cgaSize, 1, 1) void kernel_mha
     float const* kvScalePtr,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
     Vec<CgaXBuffer,
         nbProducerCtasPerCga>* __restrict__ const cgaXBuf,  // [totalNbInputTokens][maxNbSubSeq]
-    uint32_t* __restrict__ const semaphores = nullptr,      // [totalNbInputTokens]
+    uint32_t* __restrict__ const semaphores = nullptr,  // [totalNbInputTokens]
     PartialResult* __restrict__ const partialResults =
-        nullptr)  // [totalNbInputTokens][maxNbSubSeq]
+        nullptr,  // [totalNbInputTokens][maxNbSubSeq]
+    float* __restrict__ const lse =
+        nullptr)  // optional [totalNbInputTokens][nbQHeads] base-2 log-sum-exp
 {
   float const qScaleValue = qScalePtr != nullptr ? qScalePtr[0] : qScale;
   float const kvCacheScaleValue = kvScalePtr != nullptr ? kvScalePtr[0] : kvCacheScale;
@@ -1680,9 +1712,9 @@ __launch_bounds__(32 * 4 * 3, 1) __cluster_dims__(cgaSize, 1, 1) void kernel_mha
   uint32_t const ctaRank = clusterCtaRank();
   bool const isProducer = (ctaRank < nbProducerCtasPerCga);
 
-  KernelArgs const args{tensorMapQ, tensorMapK, tensorMapV,    qScaleValue,
-                        output,     cacheList,  batchSize,     kvCacheScaleValue,
-                        cgaXBuf,    semaphores, partialResults};
+  KernelArgs const args{tensorMapQ, tensorMapK, tensorMapV,     qScaleValue,
+                        output,     cacheList,  batchSize,      kvCacheScaleValue,
+                        cgaXBuf,    semaphores, partialResults, lse};
 
   if (isProducer) {
     Producer{args,
@@ -1820,9 +1852,10 @@ void launchMLA(
   uint32_t const nbCgas = exactDiv(dimGrid.x, 4) * dimGrid.y * dimGrid.z;
   auto const cgaXBuf = static_cast<Vec<CgaXBuffer, nbProducerCtasPerCga>*>(scratch);
   auto const partialResults = reinterpret_cast<PartialResult*>(cgaXBuf + nbCgas);
-  cudaError_t const err = cudaLaunchKernelEx(
-      &launchCfg, &kernel_mha, tensorMapQ, tensorMapK, tensorMapV, qScale, qScalePtr, output,
-      cacheList, batchSize, kvCacheScale, kvScalePtr, cgaXBuf, semaphores, partialResults);
+  cudaError_t const err =
+      cudaLaunchKernelEx(&launchCfg, &kernel_mha, tensorMapQ, tensorMapK, tensorMapV, qScale,
+                         qScalePtr, output, cacheList, batchSize, kvCacheScale, kvScalePtr,
+                         cgaXBuf, semaphores, partialResults, static_cast<float*>(nullptr));
 #else
   KVCacheList<false> const cacheList{kvCacheData, seqLen, maxSeqLen};
   static_assert(!usePagedKVCache);
@@ -1878,7 +1911,9 @@ static uint32_t configureKernel() {
 void launchMLAFlashInfer(
     uint32_t multiProcessorCount,
     uint32_t inputSeqLen,  // uniform for all requests and causal mask is assumed
-    float qScale, float const* qScalePtr, OutputHead* output, InputHead const* q,
+    float qScale, float const* qScalePtr, OutputHead* output,
+    float* lse,  // optional [totalNbInputTokens][nbQHeads] base-2 log-sum-exp; may be nullptr
+    InputHead const* q,
     GMemCacheHead* kCacheVLLM,                // K cache pool for VLLM layout
     GMemCacheHead* vCacheVLLM,                // V cache pool for VLLM layout
     KVCachePageIndex const* kvCachePageList,  // device pointer. shape:
@@ -1939,7 +1974,7 @@ void launchMLAFlashInfer(
   auto const partialResults = reinterpret_cast<PartialResult*>(cgaXBuf + nbCgas);
   cudaError_t const err = cudaLaunchKernelEx(
       &launchCfg, &kernel_mha, tensorMapQ, tensorMapK, tensorMapV, qScale, qScalePtr, output,
-      cacheList, batchSize, kvCacheScale, kvScalePtr, cgaXBuf, semaphores, partialResults);
+      cacheList, batchSize, kvCacheScale, kvScalePtr, cgaXBuf, semaphores, partialResults, lse);
   checkCuda(err);
 #endif
 }

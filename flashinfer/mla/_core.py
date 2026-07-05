@@ -2664,19 +2664,19 @@ def trtllm_batch_decode_with_kv_cache_mla(
         False is only supported by TRTLLM-GEN.
     lse : Optional[torch.Tensor] = None
         Optional pre-allocated buffer for Log-Sum-Exp values. Supported by
-        ``trtllm-gen``, ``cute-dsl``, and ``sparse`` backends. Must have
-        dtype ``torch.float32``. Accepted shapes:
+        ``trtllm-gen``, ``cute-dsl``, ``sparse``, and ``xqa`` backends. Must
+        have dtype ``torch.float32``. Accepted shapes:
 
         * ``[batch_size * q_len_per_request, num_qo_heads]`` (TRTLLM-GEN
-          native; accepted by sparse), or
+          native; accepted by sparse and xqa), or
         * ``[batch_size, q_len_per_request, num_qo_heads]`` (cute-dsl native;
-          also accepted by cute-dsl).
+          also accepted by cute-dsl and xqa).
 
         If ``return_lse`` is True and this is None, a buffer will be
-        allocated by the backend.
+        allocated by the backend. XQA requires the buffer to be contiguous.
     return_lse : bool = False
         Whether to return LSE values. Supported by ``trtllm-gen``,
-        ``cute-dsl``, and ``sparse`` backends. When True, the function
+        ``cute-dsl``, ``sparse``, and ``xqa`` backends. When True, the function
         returns ``(out, lse)``.
     cute_dsl_impl : str = "auto"
         Which cute-dsl implementation to use. Honored when
@@ -2799,10 +2799,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
             raise ValueError(
                 "XQA MLA does not support separate KV page indices (uses_shared_paged_kv_idx=False)"
             )
-        if return_lse or lse is not None:
-            raise NotImplementedError(
-                "XQA MLA backend does not support return_lse/lse output"
-            )
         return xqa_batch_decode_with_kv_cache_mla(
             query,
             kv_cache,
@@ -2818,6 +2814,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
             bmm2_scale,
             sinks,
             enable_pdl,
+            lse=lse,
+            return_lse=return_lse,
         )
     if backend not in ("auto", "trtllm-gen", "cute-dsl", "sparse"):
         raise ValueError(f"Backend {backend} not supported")
@@ -3176,7 +3174,9 @@ def xqa_batch_decode_with_kv_cache_mla(
     bmm2_scale: Union[float, torch.Tensor] = 1.0,
     sinks: Optional[List[torch.Tensor]] = None,
     enable_pdl: bool | None = None,
-) -> torch.Tensor:
+    lse: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""XQA-backend batched MLA decode.
 
     Single-query (MTP-aware) MLA decode kernel optimized for SM120a / SM121a tensor cores.
@@ -3226,12 +3226,22 @@ def xqa_batch_decode_with_kv_cache_mla(
     enable_pdl : Optional[bool]
         Programmatic Dependent Launch toggle.  When ``None``, auto-detects support
         from the device.
+    lse : Optional[torch.Tensor]
+        Optional log-sum-exp output tensor, dtype ``torch.float32``, contiguous,
+        shape ``[batch_size * q_len_per_request, num_heads]`` or
+        ``[batch_size, q_len_per_request, num_heads]``.  If ``None`` and
+        ``return_lse=True``, it is allocated internally in the flat shape.
+    return_lse : bool, optional
+        Whether to return the log-sum-exp of the attention logits alongside the
+        output, default ``False``.  The LSE is returned in base-2
+        (``log2(sum(exp(...)))``), matching the other MLA decode backends.
 
     Returns
     -------
-    torch.Tensor
+    Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         Attention output, shape ``[batch_size, num_heads, kv_lora_rank]``, dtype
-        ``torch.bfloat16``.
+        ``torch.bfloat16``.  When ``return_lse=True``, a ``(output, lse)`` tuple
+        is returned instead.
 
     Note
     ----
@@ -3297,6 +3307,35 @@ def xqa_batch_decode_with_kv_cache_mla(
             "out",
         )
 
+    # Remember the caller-supplied lse so we can return it in its original
+    # shape; the kernel writes through a flat contiguous view.
+    user_lse = lse
+    if return_lse or lse is not None:
+        batch_size_q, q_len, num_q_heads, _ = query.shape
+        flat_lse_shape = (batch_size_q * q_len, num_q_heads)
+        nested_lse_shape = (batch_size_q, q_len, num_q_heads)
+        if lse is None:
+            lse = torch.empty(
+                flat_lse_shape, dtype=torch.float32, device=query.device
+            )
+            user_lse = lse
+        elif tuple(lse.shape) == flat_lse_shape:
+            check_shape_dtype_device(
+                lse, flat_lse_shape, torch.float32, query.device, "lse"
+            )
+        elif tuple(lse.shape) == nested_lse_shape:
+            check_shape_dtype_device(
+                lse, nested_lse_shape, torch.float32, query.device, "lse"
+            )
+            lse = lse.view(flat_lse_shape)
+        else:
+            raise ValueError(
+                f"lse must have shape {flat_lse_shape} or {nested_lse_shape}; "
+                f"got {tuple(lse.shape)}"
+            )
+        if not lse.is_contiguous():
+            raise ValueError("XQA MLA requires a contiguous lse tensor")
+
     workspace_u8 = workspace_buffer.view(torch.uint8)
     semaphore = workspace_u8[: 8 * 1024 * 1024]  # reserve 8MB for semaphore
     scratch = workspace_u8[8 * 1024 * 1024 :]
@@ -3318,6 +3357,9 @@ def xqa_batch_decode_with_kv_cache_mla(
         kv_scale=bmm2_scale,
         sm_count=sm_count,
         enable_pdl=enable_pdl,
+        lse=lse,
     )
 
+    if return_lse:
+        return out, user_lse
     return out

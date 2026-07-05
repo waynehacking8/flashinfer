@@ -234,7 +234,9 @@ void launchMLA(
 void launchMLAFlashInfer(
     uint32_t multiProcessorCount,
     uint32_t inputSeqLen,  // uniform for all requests and causal mask is assumed
-    float qScale, float const* qScalePtr, OutputHead* output, InputHead const* q,
+    float qScale, float const* qScalePtr, OutputHead* output,
+    float* lse,  // optional [totalNbInputTokens][nbQHeads] base-2 log-sum-exp; may be nullptr
+    InputHead const* q,
     GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
     KVCachePageIndex const*
         kvCachePageList,  // device pointer. shape:

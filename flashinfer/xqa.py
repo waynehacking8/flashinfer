@@ -380,12 +380,13 @@ def get_xqa_module_mla(
 
     @register_custom_op(
         f"flashinfer::xqa_mla_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}",
-        mutates_args=("output", "workspace_buffer"),
+        mutates_args=("output", "lse", "workspace_buffer"),
     )
     def xqa_mla(
         sm_count: int,
         q_scale: Union[float, torch.Tensor],
         output: torch.Tensor,
+        lse: Optional[torch.Tensor],
         q: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
@@ -403,6 +404,7 @@ def get_xqa_module_mla(
             1.0 if isinstance(q_scale, torch.Tensor) else q_scale,
             None if isinstance(q_scale, float) else q_scale,
             output,
+            lse,
             q,
             k_cache,
             v_cache,
@@ -424,6 +426,7 @@ def get_xqa_module_mla(
         sm_count: int,
         q_scale: Union[float, torch.Tensor],
         output: torch.Tensor,
+        lse: Optional[torch.Tensor],
         q: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
@@ -458,6 +461,7 @@ def xqa_mla(
     kv_scale: Union[float, torch.Tensor] = 1.0,
     sm_count: Optional[int] = None,
     enable_pdl: Optional[bool] = None,
+    lse: Optional[torch.Tensor] = None,
 ) -> None:
     r"""Apply attention with paged KV cache using XQA MLA (Multi-Head Latent Attention) kernel.
     Parameters
@@ -500,6 +504,12 @@ def xqa_mla(
     enable_pdl : Optional[bool], default=None
         Whether to enable PDL (Persistent Data Loader) optimization.
         If None, will be set to True if hardware supports it.
+    lse : Optional[torch.Tensor], default=None
+        Optional log-sum-exp output tensor with shape
+        ``[batch_size, beam_width, num_q_heads]`` and dtype torch.float32.
+        When provided, it is filled in-place with the base-2 log-sum-exp of the
+        attention logits (``log2(sum(exp(s)))``), matching the convention of the
+        other MLA decode backends.
 
     Note
     ----
@@ -549,6 +559,7 @@ def xqa_mla(
         sm_count,
         q_scale,
         output,
+        lse,
         q,
         k_cache,
         v_cache,

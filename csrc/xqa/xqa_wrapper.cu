@@ -21,10 +21,11 @@ using tvm::ffi::Optional;
 
 #if MLA_WRAPPER
 void xqa_wrapper_mla(int64_t multiProcessorCount, double qScale, Optional<TensorView> qScaleTensor,
-                     TensorView output, TensorView q, TensorView kCacheVLLM, TensorView vCacheVLLM,
-                     TensorView kvCachePageList, int64_t maxSeqLen, TensorView seqLen,
-                     int64_t batchSize, double kvCacheScale, Optional<TensorView> kvScaleTensor,
-                     TensorView semaphores, TensorView scratch, bool enable_pdl) {
+                     TensorView output, Optional<TensorView> lse, TensorView q,
+                     TensorView kCacheVLLM, TensorView vCacheVLLM, TensorView kvCachePageList,
+                     int64_t maxSeqLen, TensorView seqLen, int64_t batchSize, double kvCacheScale,
+                     Optional<TensorView> kvScaleTensor, TensorView semaphores, TensorView scratch,
+                     bool enable_pdl) {
   auto stream = get_stream(output.device());
   float const* qScalePtr = qScaleTensor.has_value()
                                ? reinterpret_cast<float const*>(qScaleTensor.value().data_ptr())
@@ -32,13 +33,15 @@ void xqa_wrapper_mla(int64_t multiProcessorCount, double qScale, Optional<Tensor
   float const* kvScalePtr = kvScaleTensor.has_value()
                                 ? reinterpret_cast<float const*>(kvScaleTensor.value().data_ptr())
                                 : nullptr;
+  float* lsePtr =
+      lse.has_value() ? reinterpret_cast<float*>(lse.value().data_ptr()) : nullptr;
   // Extract strides from TensorView (in elements, not bytes)
   uint64_t kv_stride_page = kCacheVLLM.stride(0);
   uint64_t kv_stride_token = kCacheVLLM.stride(-2);
   uint64_t kv_stride_head = kCacheVLLM.stride(-3);
 
   launchMLAFlashInfer(multiProcessorCount, 1, qScale, qScalePtr,
-                      reinterpret_cast<OutputHead*>(output.data_ptr()),
+                      reinterpret_cast<OutputHead*>(output.data_ptr()), lsePtr,
                       reinterpret_cast<InputHead const*>(q.data_ptr()),
                       reinterpret_cast<GMemCacheHead*>(kCacheVLLM.data_ptr()),
                       reinterpret_cast<GMemCacheHead*>(vCacheVLLM.data_ptr()),

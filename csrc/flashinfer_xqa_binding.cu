@@ -18,9 +18,10 @@
 
 #if MLA_WRAPPER
 void xqa_wrapper_mla(int64_t multiProcessorCount, double qScale,
-                     tvm::ffi::Optional<TensorView> qScaleTensor, TensorView output, TensorView q,
-                     TensorView kCacheVLLM, TensorView vCacheVLLM, TensorView kvCachePageList,
-                     int64_t maxSeqLen, TensorView seqLen, int64_t batchSize, double kvCacheScale,
+                     tvm::ffi::Optional<TensorView> qScaleTensor, TensorView output,
+                     tvm::ffi::Optional<TensorView> lse, TensorView q, TensorView kCacheVLLM,
+                     TensorView vCacheVLLM, TensorView kvCachePageList, int64_t maxSeqLen,
+                     TensorView seqLen, int64_t batchSize, double kvCacheScale,
                      tvm::ffi::Optional<TensorView> kvScaleTensor, TensorView semaphores,
                      TensorView scratch, bool enable_pdl);
 

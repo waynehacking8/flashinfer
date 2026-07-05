@@ -101,8 +101,15 @@ def test_xqa_mla_batch_decode(
     workspace_buffer = global_xqa_workspace_buffer
     workspace_buffer_ref = global_workspace_buffer
 
-    # Run decode-MLA
-    output = flashinfer.decode.xqa_batch_decode_with_kv_cache_mla(
+    # Run decode-MLA. Exercise the caller-provided lse buffer path; the fill
+    # value makes unwritten rows stand out.
+    provided_lse = torch.full(
+        (batch_size * q_len_per_request, num_q_heads),
+        float("-inf"),
+        dtype=torch.float32,
+        device=device,
+    )
+    output, lse_out = flashinfer.decode.xqa_batch_decode_with_kv_cache_mla(
         query=query,
         kv_cache=kv_cache.unsqueeze(1),
         workspace_buffer=workspace_buffer,
@@ -115,7 +122,11 @@ def test_xqa_mla_batch_decode(
         bmm1_scale=scale / ((128 + 64) ** 0.5),
         bmm2_scale=1.0,
         enable_pdl=enable_pdl,
+        lse=provided_lse,
+        return_lse=True,
     )
+    assert lse_out is provided_lse
+    assert torch.isfinite(lse_out).all(), "XQA MLA decode produced non-finite LSE"
 
     # Run reference attention and align output
     sm_scale = scale / (
@@ -164,7 +175,17 @@ def test_xqa_mla_batch_decode(
     ckv = kv_cache[..., :kv_lora_rank]
     kpe = kv_cache[..., kv_lora_rank:]
 
-    o_ref = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
+    o_ref, lse_ref = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=True)
+
+    # Both backends return base-2 LSE (log2(sum(exp(s)))); an absolute offset
+    # here would indicate a wrong scale compensation, which the output check
+    # alone cannot see (it cancels in the softmax normalization).
+    torch.testing.assert_close(
+        lse_out.view(batch_size * q_len_per_request, num_q_heads),
+        lse_ref.view(batch_size * q_len_per_request, num_q_heads),
+        atol=0.1,
+        rtol=1e-3,
+    )
 
     atol = 0.05
     rtol = 0.05

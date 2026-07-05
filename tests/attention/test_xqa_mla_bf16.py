@@ -108,7 +108,9 @@ def test_xqa_mla_batch_decode_bf16(
     workspace_buffer = global_xqa_workspace_buffer
     workspace_buffer_ref = global_workspace_buffer
 
-    output = flashinfer.decode.xqa_batch_decode_with_kv_cache_mla(
+    # return_lse with lse=None exercises the internal LSE allocation path
+    # (the FP8 test covers the caller-provided buffer).
+    output, lse_out = flashinfer.decode.xqa_batch_decode_with_kv_cache_mla(
         query=query,
         kv_cache=kv_cache.unsqueeze(1),
         workspace_buffer=workspace_buffer,
@@ -121,7 +123,11 @@ def test_xqa_mla_batch_decode_bf16(
         bmm1_scale=scale / ((128 + 64) ** 0.5),
         bmm2_scale=1.0,
         enable_pdl=enable_pdl,
+        return_lse=True,
     )
+    assert lse_out.shape == (batch_size * q_len_per_request, num_q_heads)
+    assert lse_out.dtype == torch.float32
+    assert torch.isfinite(lse_out).all(), "XQA MLA decode produced non-finite LSE"
 
     # Reference: the fa2 MLA wrapper. BF16 reference is the native path,
     # no dtype conversion needed.
@@ -163,7 +169,18 @@ def test_xqa_mla_batch_decode_bf16(
     ckv = kv_cache[..., :kv_lora_rank]
     kpe = kv_cache[..., kv_lora_rank:]
 
-    o_ref = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
+    o_ref, lse_ref = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=True)
+
+    # Both backends return base-2 LSE (log2(sum(exp(s)))). BF16 rowSum is
+    # accumulated in fp32 with no fp8 requantization, so the LSE matches the
+    # reference tightly; a constant offset here would mean a wrong scale
+    # compensation, invisible to the normalized-output check below.
+    torch.testing.assert_close(
+        lse_out,
+        lse_ref.view(batch_size * q_len_per_request, num_q_heads),
+        atol=0.05,
+        rtol=1e-3,
+    )
 
     # Tighter tolerance than the FP8 test since BF16 inputs go through
     # no quantization losses. FP8 used (atol=0.05, rtol=0.05, 95% pass);
